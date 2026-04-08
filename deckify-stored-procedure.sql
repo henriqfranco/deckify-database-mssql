@@ -1,145 +1,117 @@
+USE FlashcardApp;
+GO
+
 -- ================================================
--- sp_CreateDeck
--- Cria um novo deck para um usuario existente.
--- Retorna o DeckID recem-criado.
+-- sp_DownloadDeck
+-- Registra o download de um deck da comunidade
+-- e retorna os dados completos do deck + cards.
+--
+-- Comportamento:
+-- 1) Valida usuario e deck.
+-- 2) Impede download do proprio deck.
+-- 3) Se ja existir download (UserID + DeckID), atualiza DownloadedAt.
+-- 4) Se nao existir, cria o registro em DeckDownloads.
+-- 5) Retorna 3 result sets:
+--    a) status da operacao
+--    b) metadados do deck
+--    c) lista de cards do deck
 -- ================================================
 
-CREATE OR ALTER PROCEDURE sp_CreateDeck
-    @UserID      INT,
-    @Title       NVARCHAR(100),
-    @Description NVARCHAR(500) = NULL
+CREATE OR ALTER PROCEDURE sp_DownloadDeck
+    @UserID INT,
+    @DeckID INT
 AS
 BEGIN
-    -- Evita mensagem de "N rows affected" e deixa o retorno mais limpo.
     SET NOCOUNT ON;
 
-    -- Valida se o usuario informado existe antes de inserir.
-    IF NOT EXISTS (SELECT 1
+    IF NOT EXISTS (
+        SELECT 1
     FROM Users
-    WHERE UserID = @UserID)
+    WHERE UserID = @UserID
+    )
     BEGIN
-        -- Erro de negocio: nao permite criar deck sem usuario valido.
         RAISERROR('User not found.', 16, 1);
         RETURN;
     END
 
-    -- Cria o deck com titulo obrigatorio e descricao opcional.
-    INSERT INTO Decks
-        (UserID, Title, Description)
-    VALUES
-        (@UserID, @Title, @Description);
-
-    -- Retorna o ID gerado no mesmo escopo da insercao.
-    SELECT SCOPE_IDENTITY() AS NewDeckID;
-END
-GO
-
--- ================================================
--- sp_AddCard
--- Adiciona um novo card em um deck existente.
--- Retorna o CardID recem-criado.
--- ================================================
-
-CREATE OR ALTER PROCEDURE sp_AddCard
-    @DeckID INT,
-    @Front  NVARCHAR(MAX),
-    @Back   NVARCHAR(MAX)
-AS
-BEGIN
-    -- Evita mensagem de "N rows affected" e deixa o retorno mais limpo.
-    SET NOCOUNT ON;
-
-    -- Garante que o deck exista antes de inserir o card.
-    IF NOT EXISTS (SELECT 1
+    IF NOT EXISTS (
+        SELECT 1
     FROM Decks
-    WHERE DeckID = @DeckID)
+    WHERE DeckID = @DeckID
+    )
     BEGIN
-        -- Erro de negocio: nao permite adicionar card em deck inexistente.
         RAISERROR('Deck not found.', 16, 1);
         RETURN;
     END
 
-    -- Insere frente e verso do card associados ao deck.
-    INSERT INTO Cards
-        (DeckID, Front, Back)
-    VALUES
-        (@DeckID, @Front, @Back);
-
-    -- Retorna o ID gerado no mesmo escopo da insercao.
-    SELECT SCOPE_IDENTITY() AS NewCardID;
-END
-GO
-
--- ================================================
--- sp_UpdateCard
--- Atualiza o Front e/ou Back de um card existente.
--- Se um parametro vier NULL, mantem o valor atual da coluna.
--- ================================================
-
-CREATE OR ALTER PROCEDURE sp_UpdateCard
-    @CardID INT,
-    @Front  NVARCHAR(MAX) = NULL,
-    @Back   NVARCHAR(MAX) = NULL
-AS
-BEGIN
-    -- Evita mensagem de "N rows affected" e deixa o retorno mais limpo.
-    SET NOCOUNT ON;
-
-    -- Garante que o card exista antes de atualizar.
-    IF NOT EXISTS (SELECT 1
-    FROM Cards
-    WHERE CardID = @CardID)
+    IF EXISTS (
+        SELECT 1
+    FROM Decks
+    WHERE DeckID = @DeckID
+        AND UserID = @UserID
+    )
     BEGIN
-        -- Erro de negocio: nao permite atualizar card inexistente.
-        RAISERROR('Card not found.', 16, 1);
+        RAISERROR('You cannot download your own deck.', 16, 1);
         RETURN;
     END
 
-    -- Atualiza apenas os campos informados e registra data/hora da alteracao.
-    UPDATE Cards
-    SET
-        Front     = ISNULL(@Front, Front),
-        Back      = ISNULL(@Back,  Back),
-        UpdatedAt = GETDATE()
-    WHERE CardID = @CardID;
-END
-GO
-
--- ================================================
--- sp_DeleteCard
--- Remove um card especifico pelo ID.
--- ================================================
-
-CREATE OR ALTER PROCEDURE sp_DeleteCard
-    @CardID INT
-AS
-BEGIN
-    -- Evita mensagem de "N rows affected" e deixa o retorno mais limpo.
-    SET NOCOUNT ON;
-
-    -- Garante que o card exista antes de excluir.
-    IF NOT EXISTS (SELECT 1
-    FROM Cards
-    WHERE CardID = @CardID)
+    IF EXISTS (
+        SELECT 1
+    FROM DeckDownloads
+    WHERE UserID = @UserID
+        AND DeckID = @DeckID
+    )
     BEGIN
-        -- Erro de negocio: nao permite excluir card inexistente.
-        RAISERROR('Card not found.', 16, 1);
-        RETURN;
+        UPDATE DeckDownloads
+        SET DownloadedAt = GETDATE()
+        WHERE UserID = @UserID
+            AND DeckID = @DeckID;
+
+        SELECT
+            CAST(0 AS BIT) AS IsFirstDownload,
+            'Download timestamp refreshed.' AS [Message];
+    END
+    ELSE
+    BEGIN
+        INSERT INTO DeckDownloads
+            (UserID, DeckID, DownloadedAt)
+        VALUES
+            (@UserID, @DeckID, GETDATE());
+
+        SELECT
+            CAST(1 AS BIT) AS IsFirstDownload,
+            'Deck downloaded successfully.' AS [Message];
     END
 
-    -- Exclui o registro alvo da tabela Cards.
-    DELETE FROM Cards WHERE CardID = @CardID;
+    SELECT
+        d.DeckID,
+        d.Title,
+        d.Description,
+        d.UserID                    AS DeckOwnerUserID,
+        owner_u.Username            AS DeckOwnerUsername,
+        dd.UserID                   AS DownloadedByUserID,
+        downloader_u.Username       AS DownloadedByUsername,
+        dd.DownloadedAt,
+        d.CreatedAt,
+        d.UpdatedAt
+    FROM Decks d
+        INNER JOIN Users owner_u ON owner_u.UserID = d.UserID
+        INNER JOIN DeckDownloads dd ON dd.DeckID = d.DeckID AND dd.UserID = @UserID
+        INNER JOIN Users downloader_u ON downloader_u.UserID = dd.UserID
+    WHERE d.DeckID = @DeckID;
+
+    SELECT
+        c.CardID,
+        c.DeckID,
+        c.Front,
+        c.Back,
+        c.CreatedAt,
+        c.UpdatedAt
+    FROM Cards c
+    WHERE c.DeckID = @DeckID
+    ORDER BY c.CardID;
 END
 GO
 
--- Create a new deck
-EXEC sp_CreateDeck @UserID = 1, @Title = 'SQL Basics', @Description = 'Core SQL concepts';
-
--- Add a card to it (use the DeckID returned above)
-EXEC sp_AddCard @DeckID = 4, @Front = 'What does SELECT do?', @Back = 'Retrieves rows from a table';
-
--- Update only the Back of a card (Front stays unchanged)
-EXEC sp_UpdateCard @CardID = 1, @Back = 'Updated answer here';
-
--- Delete a card
-EXEC sp_DeleteCard @CardID = 1;
+-- Exemplo de uso
+EXEC sp_DownloadDeck @UserID = 1, @DeckID = 3;

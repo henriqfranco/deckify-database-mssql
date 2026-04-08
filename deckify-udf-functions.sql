@@ -2,147 +2,85 @@ USE FlashcardApp;
 GO
 
 -- ================================================
--- fn_GetCardCount
--- Retorna a quantidade total de cards de um deck.
+-- fn_GetDeckInsights (Table-Valued Function)
+-- Retorna uma visao consolidada dos decks, incluindo:
+-- - dados do dono
+-- - total de cards
+-- - total de downloads
+-- - ultimo download
+-- - indicador se um usuario especifico ja baixou o deck
 --
--- Como funciona:
--- 1) Recebe @DeckID como entrada.
--- 2) Conta os registros da tabela Cards com esse DeckID.
--- 3) Retorna o total como INT.
+-- Parametros:
+-- @DeckID: filtra um deck especifico (NULL = todos)
+-- @UserID: calcula HasUserDownloaded para esse usuario (NULL = sempre 0)
 --
--- Uso: SELECT dbo.fn_GetCardCount(1)
+-- Uso:
+-- SELECT * FROM dbo.fn_GetDeckInsights(NULL, NULL)
+-- SELECT * FROM dbo.fn_GetDeckInsights(3, NULL)
+-- SELECT * FROM dbo.fn_GetDeckInsights(NULL, 1)
 -- ================================================
 
-CREATE OR ALTER FUNCTION dbo.fn_GetCardCount
+CREATE OR ALTER FUNCTION dbo.fn_GetDeckInsights
 (
-    @DeckID INT
-)
-RETURNS INT
-AS
-BEGIN
-    -- Agregacao simples para obter o total de cards do deck informado.
-    RETURN (
-        SELECT COUNT(*)
-    FROM Cards
-    WHERE DeckID = @DeckID
-    );
-END
-GO
-
--- ================================================
--- fn_GetDeckCount
--- Retorna a quantidade total de decks de um usuario.
---
--- Como funciona:
--- 1) Recebe @UserID como entrada.
--- 2) Conta os registros da tabela Decks desse usuario.
--- 3) Retorna o total como INT.
---
--- Uso: SELECT dbo.fn_GetDeckCount(1)
--- ================================================
-
-CREATE OR ALTER FUNCTION dbo.fn_GetDeckCount
-(
-    @UserID INT
-)
-RETURNS INT
-AS
-BEGIN
-    -- Agregacao simples para obter o total de decks do usuario informado.
-    RETURN (
-        SELECT COUNT(*)
-    FROM Decks
-    WHERE UserID = @UserID
-    );
-END
-GO
-
--- ================================================
--- fn_GetCardsByDeck (Table-Valued Function)
--- Retorna todos os cards de um deck especifico.
--- E util para filtros, joins e CROSS APPLY.
---
--- Como funciona:
--- 1) Recebe @DeckID como parametro.
--- 2) Retorna uma tabela com CardID, Front, Back e CreatedAt.
--- 3) Inclui apenas linhas cujo DeckID corresponda ao parametro.
---
--- Uso: SELECT * FROM dbo.fn_GetCardsByDeck(2)
--- ================================================
-
-CREATE OR ALTER FUNCTION dbo.fn_GetCardsByDeck
-(
-    @DeckID INT
+    @DeckID INT = NULL,
+    @UserID INT = NULL
 )
 RETURNS TABLE
 AS
 RETURN
 (
-    -- TVF inline: o resultado desta consulta e o retorno da funcao.
     SELECT
-    CardID,
-    Front,
-    Back,
-    CreatedAt
-FROM Cards
-WHERE DeckID = @DeckID
-);
-GO
-
--- ================================================
--- fn_SearchCards (Table-Valued Function)
--- Busca cards por palavra-chave em Front e Back,
--- com filtro opcional por deck.
---
--- Como funciona:
--- 1) Recebe @Keyword para pesquisa textual (LIKE).
--- 2) Faz JOIN com Decks para retornar DeckID e DeckTitle.
--- 3) Se @DeckID for NULL, busca em todos os decks.
--- 4) Se @DeckID tiver valor, limita a busca ao deck informado.
---
--- Uso: SELECT * FROM dbo.fn_SearchCards('closure', NULL)
---      SELECT * FROM dbo.fn_SearchCards('ls', 1)
--- ================================================
-
-CREATE OR ALTER FUNCTION dbo.fn_SearchCards
-(
-    @Keyword NVARCHAR(200),
-    @DeckID  INT = NULL
-)
-RETURNS TABLE
-AS
-RETURN
-(
-    -- TVF inline com busca textual e filtro opcional por deck.
-    SELECT
-    c.CardID,
-    c.Front,
-    c.Back,
     d.DeckID,
-    d.Title AS DeckTitle
-FROM Cards c
-    INNER JOIN Decks d ON d.DeckID = c.DeckID
-WHERE
-        (c.Front LIKE '%' + @Keyword + '%' OR c.Back LIKE '%' + @Keyword + '%')
-    AND (@DeckID IS NULL OR c.DeckID = @DeckID)
+    d.Title                   AS DeckTitle,
+    d.Description,
+    d.UserID                  AS DeckOwnerUserID,
+    u.Username                AS DeckOwnerUsername,
+    ISNULL(card_stats.TotalCards, 0)         AS TotalCards,
+    ISNULL(download_stats.TotalDownloads, 0) AS TotalDownloads,
+    download_stats.LastDownloadedAt,
+    CAST(
+            CASE
+                WHEN @UserID IS NULL THEN 0
+                WHEN EXISTS (
+                    SELECT 1
+    FROM DeckDownloads dd_user
+    WHERE dd_user.DeckID = d.DeckID
+        AND dd_user.UserID = @UserID
+                ) THEN 1
+                ELSE 0
+            END AS BIT
+        ) AS HasUserDownloaded,
+    d.CreatedAt,
+    d.UpdatedAt
+FROM Decks d
+    INNER JOIN Users u ON u.UserID = d.UserID
+    LEFT JOIN (
+            SELECT
+        DeckID,
+        COUNT(*) AS TotalCards
+    FROM Cards
+    GROUP BY DeckID
+        ) card_stats ON card_stats.DeckID = d.DeckID
+    LEFT JOIN (
+            SELECT
+        DeckID,
+        COUNT(*)          AS TotalDownloads,
+        MAX(DownloadedAt) AS LastDownloadedAt
+    FROM DeckDownloads
+    GROUP BY DeckID
+        ) download_stats ON download_stats.DeckID = d.DeckID
+WHERE @DeckID IS NULL OR d.DeckID = @DeckID
 );
 GO
 
--- Exibe cada deck com a contagem de cards calculada pela UDF escalar
-SELECT DeckID, Title, dbo.fn_GetCardCount(DeckID) AS TotalCards
-FROM Decks
-WHERE UserID = 1;
-
--- Busca global em todos os decks (passando @DeckID = NULL)
+-- Exibe insights de todos os decks
 SELECT *
-FROM dbo.fn_SearchCards('hoisting', NULL);
+FROM dbo.fn_GetDeckInsights(NULL, NULL);
 
--- Busca limitada a um deck especifico
+-- Exibe insights de um deck especifico
 SELECT *
-FROM dbo.fn_SearchCards('ls', 1);
+FROM dbo.fn_GetDeckInsights(3, NULL);
 
--- Exemplo de combinacao da TVF com Decks usando CROSS APPLY
-SELECT d.Title, c.Front, c.Back
-FROM Decks d
-CROSS APPLY dbo.fn_GetCardsByDeck(d.DeckID) c
-WHERE d.UserID = 1;
+-- Exibe insights incluindo o indicador de download para um usuario
+SELECT *
+FROM dbo.fn_GetDeckInsights(NULL, 1);
